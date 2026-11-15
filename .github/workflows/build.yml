@@ -1,0 +1,49 @@
+name: build-pyslam-for-pi5
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Free ARM64 runner (public repos): same CPU architecture as the Pi 5
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine info
+        run: |
+          nproc; free -h; df -h /; uname -m
+
+      - name: Add 12 GB swap (heavy C++ files need >10 GB while compiling)
+        run: |
+          sudo fallocate -l 12G /swapfile_build
+          sudo chmod 600 /swapfile_build
+          sudo mkswap /swapfile_build
+          sudo swapon /swapfile_build
+          free -h
+
+      - name: Build inside debian:trixie (matches Raspberry Pi OS 13)
+        run: |
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD":/work \
+            -e PYSLAM_COMMIT=a4e6a31f211ac6b2f9ecf4ab628734f6194caa15 \
+            debian:trixie bash /work/build_root.sh
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyslam-pi-build
+          path: |
+            out/pyslam_pi_build.tar.gz
+            out/build_report.txt
+          if-no-files-found: error
+
+      - name: Upload logs (also on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: out/logs/
+          if-no-files-found: ignore
