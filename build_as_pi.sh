@@ -23,6 +23,13 @@ git log -1 --oneline
 step "patch build flags for Pi 5 CPU"
 grep -rlE -- "-march=native|-mtune=native" --include=CMakeLists.txt --include=*.cmake --include=*.sh . 2>/dev/null \
   | xargs -r sed -i -E "s/-march=native/${PI_CPU}/g; s/-mtune=native//g"
+# pySLAM's scripts pass WITH_MARCH_NATIVE=ON / GTSAM_BUILD_WITH_MARCH_NATIVE=ON to every CMake build
+# (GTSAM even makes -march=native PUBLIC, so it leaks into the core). Turn them off at the source.
+grep -rlE "MARCH_NATIVE(=| *: *)ON|MARCH_NATIVE=\"?ON|MARCH_NATIVE ON" . --include=*.sh --include=CMakeLists.txt --include=*.cmake 2>/dev/null \
+  | tee /work/out/logs/00_march_native_patched_files.txt \
+  | xargs -r sed -i -E 's/(MARCH_NATIVE)=ON/\1=OFF/g; s/(MARCH_NATIVE)="ON"/\1="OFF"/g; s/(option\([A-Z_]*MARCH_NATIVE[^)]*)ON\)/\1OFF)/g'
+grep -rnE "MARCH_NATIVE" --include=*.sh . | head -20 || true
+export WITH_MARCH_NATIVE=OFF GTSAM_BUILD_WITH_MARCH_NATIVE=OFF
 grep -rlE 'make -j ?\$\(nproc\)' --include=*.sh . | xargs -r sed -i -E 's/make -j ?\$\(nproc\)/make -j3/g'
 sed -i -E 's/make -j ?4\b/make -j2/' cpp/build.sh
 export CFLAGS="${PI_CPU}" CXXFLAGS="${PI_CPU}"
@@ -54,7 +61,10 @@ grep -nE "error:|Error [0-9]|FAILED" $LOG/04_thirdparty.log | head -20 || true
 step "GTSAM (pySLAM's own version)"
 # header of install_thirdparty.sh (sets EXTERNAL_OPTIONS etc.) + the gtsam call only
 awk '/Configuring and building thirdparty\//{exit} {print}' scripts/install_thirdparty.sh > scripts/tp_gtsam.sh
+echo 'EXTERNAL_OPTIONS="${EXTERNAL_OPTIONS//-DWITH_MARCH_NATIVE=ON/-DWITH_MARCH_NATIVE=OFF} -DWITH_MARCH_NATIVE=OFF -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF"' >> scripts/tp_gtsam.sh
 echo '$SCRIPTS_DIR/install_gtsam.sh $EXTERNAL_OPTIONS' >> scripts/tp_gtsam.sh
+# install_gtsam.sh may hard-code the option in its own GTSAM_OPTIONS line
+sed -i -E 's/GTSAM_BUILD_WITH_MARCH_NATIVE=ON/GTSAM_BUILD_WITH_MARCH_NATIVE=OFF/g' scripts/install_gtsam.sh
 bash scripts/tp_gtsam.sh > $LOG/05_gtsam.log 2>&1 || echo "WARN: gtsam returned non-zero"
 grep -nE "error:|FAILED|Killed" $LOG/05_gtsam.log | head -20 || true
 ls thirdparty/gtsam_local/install/lib 2>/dev/null | head || echo "NO gtsam_local/install"
@@ -74,14 +84,18 @@ REPORT=/work/out/build_report.txt
 {
   echo "pySLAM commit: $(git rev-parse HEAD)"
   echo "built: $(date -u)  | $(gcc --version | head -1) | $(python --version)"
-  echo; echo "== native-CPU flags left in build files (must be empty):"
-  grep -rlE -- "-march=native|-mcpu=native" --include=flags.make . 2>/dev/null | head || true
+  echo; echo "== native-CPU flags in shipped targets (must be 0):"
+  NATIVE=$(grep -rlE -- "-march=native|-mcpu=native|-mtune=native" --include=flags.make . 2>/dev/null | grep -vE "/(timing|tests?|examples?)/" || true)
+  echo "count: $(printf '%s' "$NATIVE" | grep -c . || true)"; printf '%s\n' "$NATIVE" | head -20
+  echo "$NATIVE" > /work/out/native_flags.txt
+  echo; echo "== GTSAM public compile options:"; grep -E "GTSAM_COMPILE_OPTIONS_PUBLIC|BUILD_WITH_MARCH_NATIVE" $LOG/05_gtsam.log | head -5
   echo; echo "== volumetric:";  ls -la cpp/lib/volumetric*.so 2>&1
   echo; echo "== C++ core:";    ls -la cpp/core/slam/lib 2>&1
   echo; echo "== gtsam_local:"; ls thirdparty/gtsam_local/install/lib 2>&1 | head -20
   echo; echo "== import test (Python side, C++ modules):"
   cd cpp/lib && python -c "import volumetric; print('volumetric import OK')" 2>&1 | tail -2; cd $ROOT
-  cd cpp/core/slam/lib 2>/dev/null && python -c "import cpp_core; print('cpp_core import OK')" 2>&1 | tail -2; cd $ROOT
+  cd cpp/core/slam/lib 2>/dev/null && python -c "import cpp_core; print('cpp_core import OK')" 2>&1 | tail -12; cd $ROOT
+  echo "(cpp_core may fail here only because this minimal env lacks pySLAM's Python deps; the real test is on the Pi)"
 } > $REPORT 2>&1
 cat $REPORT
 
@@ -94,4 +108,5 @@ printf '%s\n' "${PACK[@]}" | tee /work/out/pack_list.txt
 tar -C / -czf /work/out/pyslam_pi_build.tar.gz "${PACK[@]}"
 ls -lh /work/out/pyslam_pi_build.tar.gz
 [ -d cpp/core/slam/lib ] || die "C++ core did not build (see 07_core.log)"
+[ -s /work/out/native_flags.txt ] && grep -q . /work/out/native_flags.txt && die "-march=native still present in shipped targets (see build_report.txt) - NOT safe for the Pi"
 echo "DONE"
