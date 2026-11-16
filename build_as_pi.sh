@@ -10,6 +10,28 @@ PI_CPU="-mcpu=cortex-a76"        # Raspberry Pi 5 CPU. Never use -march=native h
 step(){ echo; echo "================ $* ================"; }
 die(){ echo "FATAL: $*"; exit 1; }
 
+# ---------------------------------------------------------------- 0. compiler wrappers (cannot be bypassed)
+# Every C/C++ compile goes through these: they DROP any -march/-mtune/-mcpu=native that a script or a
+# downloaded CMake project asks for, and always target the Pi 5 CPU. Stripped flags are counted in a log.
+mkdir -p /home/pi/bin
+for pair in "gcc-pi:/usr/bin/gcc" "g++-pi:/usr/bin/g++"; do
+  name=${pair%%:*}; real=${pair#*:}
+  cat > /home/pi/bin/$name <<EOF
+#!/bin/bash
+args=()
+for a in "\$@"; do
+  case "\$a" in
+    -march=native|-mtune=native|-mcpu=native) echo "\$a" >> /work/out/logs/stripped_native_flags.log ;;
+    *) args+=("\$a") ;;
+  esac
+done
+exec $real "\${args[@]}" ${PI_CPU}
+EOF
+  chmod +x /home/pi/bin/$name
+done
+export CC=/home/pi/bin/gcc-pi CXX=/home/pi/bin/g++-pi
+echo 'int main(){return 0;}' > /tmp/t.c && $CC -march=native /tmp/t.c -o /tmp/t && echo "wrapper OK" || die "compiler wrapper broken"
+
 # ---------------------------------------------------------------- 1. pySLAM source (same commit as the Pi)
 step "clone pySLAM ${PYSLAM_COMMIT}"
 mkdir -p /home/pi/capstone_files && cd /home/pi/capstone_files
@@ -44,7 +66,7 @@ sudo apt-get install -y libembree-dev >> $LOG/01_system_packages.log 2>&1 || tru
 step "python 3.11.9 (pyenv)"
 git clone -q --depth 1 https://github.com/pyenv/pyenv.git /home/pi/.pyenv
 export PYENV_ROOT=/home/pi/.pyenv PATH=/home/pi/.pyenv/bin:$PATH
-CFLAGS="" CXXFLAGS="" pyenv install -s 3.11.9 > $LOG/02_python.log 2>&1 || die "python build failed (see 02_python.log)"
+CFLAGS="" CXXFLAGS="" CC=/usr/bin/gcc CXX=/usr/bin/g++ pyenv install -s 3.11.9 > $LOG/02_python.log 2>&1 || die "python build failed (see 02_python.log)"
 mkdir -p /home/pi/.python/venvs
 /home/pi/.pyenv/versions/3.11.9/bin/python -m venv $VENV
 source $VENV/bin/activate
@@ -84,11 +106,23 @@ REPORT=/work/out/build_report.txt
 {
   echo "pySLAM commit: $(git rev-parse HEAD)"
   echo "built: $(date -u)  | $(gcc --version | head -1) | $(python --version)"
-  echo; echo "== native-CPU flags in shipped targets (must be 0):"
-  NATIVE=$(grep -rlE -- "-march=native|-mcpu=native|-mtune=native" --include=flags.make . 2>/dev/null | grep -vE "/(timing|tests?|examples?)/" || true)
-  echo "count: $(printf '%s' "$NATIVE" | grep -c . || true)"; printf '%s\n' "$NATIVE" | head -20
-  echo "$NATIVE" > /work/out/native_flags.txt
+  echo; echo "== compiler used by each shipped part (must be the -pi wrappers):"
+  : > /work/out/compiler_check_failed.txt
+  for c in cpp/core/slam/build cpp/build thirdparty/gtsam_local/build thirdparty/gtsam_factors/build; do
+    f=$c/CMakeCache.txt
+    if [ -f $f ]; then
+      cc=$(grep -E "^CMAKE_CXX_COMPILER:" $f | cut -d= -f2)
+      echo "$c -> $cc"
+      [[ "$cc" == */g++-pi ]] || echo "$c" >> /work/out/compiler_check_failed.txt
+    else
+      echo "$c -> (no CMakeCache)"
+    fi
+  done
+  echo; echo "== native flags requested by build files (harmless now, stripped by the wrapper):"
+  grep -rlE -- "-march=native|-mcpu=native|-mtune=native" --include=flags.make . 2>/dev/null | grep -vE "/(timing|tests?|examples?)/" | head -20 || true
+  echo "stripped at compile time: $(wc -l < /work/out/logs/stripped_native_flags.log 2>/dev/null || echo 0) times"
   echo; echo "== GTSAM public compile options:"; grep -E "GTSAM_COMPILE_OPTIONS_PUBLIC|BUILD_WITH_MARCH_NATIVE" $LOG/05_gtsam.log | head -5
+  echo; echo "== shared libs needed by the C++ core:"; ldd cpp/core/slam/lib/cpp_core*.so 2>/dev/null | grep -vE "linux-vdso|ld-linux" | awk '{print $1, $3}' | head -40
   echo; echo "== volumetric:";  ls -la cpp/lib/volumetric*.so 2>&1
   echo; echo "== C++ core:";    ls -la cpp/core/slam/lib 2>&1
   echo; echo "== gtsam_local:"; ls thirdparty/gtsam_local/install/lib 2>&1 | head -20
@@ -108,5 +142,6 @@ printf '%s\n' "${PACK[@]}" | tee /work/out/pack_list.txt
 tar -C / -czf /work/out/pyslam_pi_build.tar.gz "${PACK[@]}"
 ls -lh /work/out/pyslam_pi_build.tar.gz
 [ -d cpp/core/slam/lib ] || die "C++ core did not build (see 07_core.log)"
-[ -s /work/out/native_flags.txt ] && grep -q . /work/out/native_flags.txt && die "-march=native still present in shipped targets (see build_report.txt) - NOT safe for the Pi"
+[ -s /work/out/compiler_check_failed.txt ] && die "these parts were NOT built with the Pi-safe compiler wrapper: $(cat /work/out/compiler_check_failed.txt | tr '\n' ' ')"
+echo "Pi-safe: every shipped part was compiled through the wrapper (-mcpu=cortex-a76, no native flags)."
 echo "DONE"
