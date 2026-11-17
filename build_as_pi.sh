@@ -165,9 +165,34 @@ echo "extra libs packed:"; cat /work/out/extra_libs.txt
 printf '%s\n' "${PACK[@]}" | tee /work/out/pack_list.txt
 tar -C / -czf /work/out/pyslam_pi_build.tar.gz "${PACK[@]}"
 ls -lh /work/out/pyslam_pi_build.tar.gz
-tar -tzf /work/out/pyslam_pi_build.tar.gz | grep -qE "/gtsam/__init__\.py$" || die "archive has no gtsam/__init__.py - GTSAM python package not packed"
-tar -tzf /work/out/pyslam_pi_build.tar.gz | grep -E "/gtsam/__init__\.py$|gtsam.*\.(pth|egg-link)$|gtsam.*dist-info/?$" | tee -a /work/out/build_report.txt
+# list to a file first: 'tar | grep -q' + pipefail gives a false failure (SIGPIPE when grep exits early)
+tar -tzf /work/out/pyslam_pi_build.tar.gz > /work/out/archive_list.txt || die "cannot list archive"
+echo "archive entries: $(wc -l < /work/out/archive_list.txt)" | tee -a /work/out/build_report.txt
+grep -E "/gtsam/__init__\.py$|gtsam.*\.(pth|egg-link)$|gtsam.*dist-info/?$|gtsam_factors.*\.so" /work/out/archive_list.txt | tee -a /work/out/build_report.txt
+grep -qE "/gtsam/__init__\.py$" /work/out/archive_list.txt || die "archive has no gtsam/__init__.py - GTSAM python package not packed"
 [ -d cpp/core/slam/lib ] || die "C++ core did not build (see 07_core.log)"
+# every shipped .so must resolve all its libraries from paths that exist on the Pi too
+# (system libs, or files inside this archive). libpython is provided by the Pi's own python at import time.
+: > /work/out/missing_libs.txt
+grep -E "\.so(\.[0-9]+)*$" /work/out/archive_list.txt | while read -r so; do
+  [ -f "/$so" ] || continue
+  ldd "/$so" 2>/dev/null | grep "not found" | grep -v "libpython3" | sed "s#^#$so: #" >> /work/out/missing_libs.txt || true
+  ldd "/$so" 2>/dev/null | awk '/=> \/home\/pi\// {print $3}' | while read -r dep; do
+    case "$dep" in
+      /home/pi/.pyenv/*) continue ;;   # the Pi has the same pyenv python 3.11.9
+      /home/pi/capstone_files/pyslam/thirdparty/json/*|/home/pi/capstone_files/pyslam/thirdparty/qhull/*|\
+      /home/pi/capstone_files/pyslam/thirdparty/orbslam2_features/*|/home/pi/capstone_files/pyslam/thirdparty/pangolin/*|\
+      /home/pi/capstone_files/pyslam/thirdparty/g2o/*|/home/pi/capstone_files/pyslam/thirdparty/pydbow*/*|\
+      /home/pi/capstone_files/pyslam/thirdparty/pyibow/*|/home/pi/capstone_files/pyslam/cpp/lib/*)
+        continue ;;                    # built on the Pi itself already (same sources, same paths)
+    esac
+    grep -qxF "${dep#/}" /work/out/archive_list.txt || grep -qxF "$(readlink -f "$dep" | sed 's#^/##')" /work/out/archive_list.txt \
+      || echo "$so: needs $dep (not in archive, not on the Pi)" >> /work/out/missing_libs.txt
+  done
+done
+echo "== library check:" | tee -a /work/out/build_report.txt
+if [ -s /work/out/missing_libs.txt ]; then cat /work/out/missing_libs.txt | tee -a /work/out/build_report.txt; die "some shipped libraries have unresolved dependencies (see above)"; fi
+echo "all shipped libraries resolve (libpython comes from the Pi's python)" | tee -a /work/out/build_report.txt
 [ -s /work/out/compiler_check_failed.txt ] && die "these parts were NOT built with the Pi-safe compiler wrapper: $(cat /work/out/compiler_check_failed.txt | tr '\n' ' ')"
 echo "Pi-safe: every shipped part was compiled through the wrapper (-mcpu=cortex-a76, no native flags)."
 echo "DONE"
