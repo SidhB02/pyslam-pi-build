@@ -139,6 +139,15 @@ REPORT=/work/out/build_report.txt
 cat $REPORT
 
 PACK=()
+# GTSAM's installed libs (libgtsam, libgtsam_unstable, libmetis-gtsam) have no RPATH, so on their own they
+# can't find each other. Add $ORIGIN (= their own folder) so they always resolve their siblings on the Pi.
+if [ -d thirdparty/gtsam_local/install/lib ]; then
+  command -v patchelf >/dev/null || sudo apt-get install -y patchelf >/dev/null 2>&1 || pip install -q patchelf
+  find thirdparty/gtsam_local/install/lib -maxdepth 1 -type f -name "*.so*" | while read -r f; do
+    old=$(patchelf --print-rpath "$f" 2>/dev/null || true)
+    patchelf --set-rpath "\$ORIGIN${old:+:$old}" "$f" && echo "rpath \$ORIGIN set: $f"
+  done
+fi
 for p in cpp/core/slam/lib thirdparty/gtsam_local/install; do [ -e "$p" ] && PACK+=("home/pi/capstone_files/pyslam/$p"); done
 for f in cpp/lib/volumetric*.so; do [ -e "$f" ] && PACK+=("home/pi/capstone_files/pyslam/$f"); done
 while IFS= read -r f; do PACK+=("home/pi/capstone_files/pyslam/$f"); done < <(find thirdparty/gtsam_factors -name "*.so*" 2>/dev/null)

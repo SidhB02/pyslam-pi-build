@@ -9,7 +9,7 @@ apt-get install -y --no-install-recommends \
   sudo git curl wget ca-certificates lsb-release pkg-config file \
   build-essential cmake gcc g++ \
   libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev \
-  liblzma-dev tk-dev libncurses-dev xz-utils uuid-dev
+  liblzma-dev tk-dev libncurses-dev xz-utils uuid-dev patchelf
 
 echo "gcc: $(gcc --version | head -1)"; echo "cmake: $(cmake --version | head -1)"
 
