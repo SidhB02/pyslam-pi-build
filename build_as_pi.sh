@@ -130,6 +130,11 @@ REPORT=/work/out/build_report.txt
   cd cpp/lib && python -c "import volumetric; print('volumetric import OK')" 2>&1 | tail -2; cd $ROOT
   cd cpp/core/slam/lib 2>/dev/null && python -c "import cpp_core; print('cpp_core import OK')" 2>&1 | tail -12; cd $ROOT
   echo "(cpp_core may fail here only because this minimal env lacks pySLAM's Python deps; the real test is on the Pi)"
+  echo; echo "== GTSAM python package (must be the 4.2 build, matching gtsam_factors):"
+  python -c "import gtsam, os; print('gtsam', getattr(gtsam,'__version__','?'), os.path.dirname(gtsam.__file__))" 2>&1 | tail -2
+  ls -d $VENV/lib/python3.11/site-packages/gtsam* 2>&1
+  echo; echo "== gtsam + gtsam_factors together:"
+  PYTHONPATH=thirdparty/gtsam_factors/lib python -c "import gtsam, gtsam_factors; print('gtsam + gtsam_factors import OK')" 2>&1 | tail -3
 } > $REPORT 2>&1
 cat $REPORT
 
@@ -137,10 +142,31 @@ PACK=()
 for p in cpp/core/slam/lib thirdparty/gtsam_local/install; do [ -e "$p" ] && PACK+=("home/pi/capstone_files/pyslam/$p"); done
 for f in cpp/lib/volumetric*.so; do [ -e "$f" ] && PACK+=("home/pi/capstone_files/pyslam/$f"); done
 while IFS= read -r f; do PACK+=("home/pi/capstone_files/pyslam/$f"); done < <(find thirdparty/gtsam_factors -name "*.so*" 2>/dev/null)
+# GTSAM 4.2 python package (gtsam, gtsam_unstable + dist-info) so gtsam_factors' pybind types match on the Pi
+python -c "import gtsam" 2>/dev/null || { [ -d thirdparty/gtsam_local/build/python ] && pip install -q thirdparty/gtsam_local/build/python > $LOG/08_gtsam_py.log 2>&1; }
+PYTHONPATH=thirdparty/gtsam_factors/lib python -c "import gtsam, gtsam_factors" || die "gtsam + gtsam_factors do not import together"
+# pack wherever python ACTUALLY loads gtsam / gtsam_unstable from (may be the build tree via a .pth/editable link)
+for m in gtsam gtsam_unstable; do
+  d=$(python -c "import $m, os; print(os.path.dirname($m.__file__))" 2>/dev/null) || continue
+  echo "$m loads from: $d" | tee -a /work/out/build_report.txt
+  [ -n "$d" ] && PACK+=("${d#/}")
+done
+# plus any gtsam-related link/metadata files in site-packages (.pth, egg-link, dist-info, editable finders)
+while IFS= read -r f; do PACK+=("${f#/}"); done < <(find $VENV/lib/python3.11/site-packages -maxdepth 1 -iname "*gtsam*" 2>/dev/null)
+# and any of OUR libraries those python extensions load (e.g. libgtsam.so.4 from the build tree)
+for p in "${PACK[@]}"; do
+  find "/$p" -name "*.so*" -type f 2>/dev/null
+done | xargs -r ldd 2>/dev/null | awk '/=> \/home\/pi\/capstone_files/ {print $3}' | sort -u | while read -r lib; do
+  real=$(readlink -f "$lib"); echo "${lib#/}"; echo "${real#/}"
+done > /work/out/extra_libs.txt
+while IFS= read -r f; do [ -n "$f" ] && PACK+=("$f"); done < /work/out/extra_libs.txt
+echo "extra libs packed:"; cat /work/out/extra_libs.txt
 [ ${#PACK[@]} -gt 0 ] || die "nothing built to pack"
 printf '%s\n' "${PACK[@]}" | tee /work/out/pack_list.txt
 tar -C / -czf /work/out/pyslam_pi_build.tar.gz "${PACK[@]}"
 ls -lh /work/out/pyslam_pi_build.tar.gz
+tar -tzf /work/out/pyslam_pi_build.tar.gz | grep -qE "/gtsam/__init__\.py$" || die "archive has no gtsam/__init__.py - GTSAM python package not packed"
+tar -tzf /work/out/pyslam_pi_build.tar.gz | grep -E "/gtsam/__init__\.py$|gtsam.*\.(pth|egg-link)$|gtsam.*dist-info/?$" | tee -a /work/out/build_report.txt
 [ -d cpp/core/slam/lib ] || die "C++ core did not build (see 07_core.log)"
 [ -s /work/out/compiler_check_failed.txt ] && die "these parts were NOT built with the Pi-safe compiler wrapper: $(cat /work/out/compiler_check_failed.txt | tr '\n' ' ')"
 echo "Pi-safe: every shipped part was compiled through the wrapper (-mcpu=cortex-a76, no native flags)."
